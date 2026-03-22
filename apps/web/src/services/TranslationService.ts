@@ -47,6 +47,9 @@ export class TranslationService {
   // Browser SpeechRecognition instance
   private browserRecognition: any = null;
 
+  // Whether browser STT is the active/primary STT mode (vs server-side Whisper)
+  private browserSttActive = false;
+
   // Speaker's language for STT (set explicitly for better recognition)
   private speakerLanguage: string = 'en-US';
 
@@ -257,19 +260,28 @@ export class TranslationService {
     const resolvedTargetLanguage = targetLanguage || language || 'en';
 
     /**
-     * IMPORTANT: For production-quality voice translation we ALWAYS prefer
-     * server-side streaming STT (ElevenLabs/Sarvam/Azure) over browser
-     * SpeechRecognition. The \"legacy\" PCM path sends 16kHz audio chunks
-     * to the backend (`call:start-stt` + `call:audio-chunk`), which then:
-     *   - Runs ElevenLabs STT
-     *   - Translates via TranslationService (Libre/Sarvam/etc.)
-     *   - Generates TTS via Sarvam/ElevenLabs/Google
-     *
-     * This avoids browser STT limitations and keeps all language handling
-     * in one place on the server.
+     * STT STRATEGY (updated):
+     * 1. PRIMARY: Browser SpeechRecognition (free, no API key, works instantly).
+     *    Recognized text is sent via `call:speech` → server translates + TTS → other user.
+     *    This bypasses the Whisper dependency entirely.
+     * 2. FALLBACK: Server-side PCM → Whisper STT (if browser STT not available,
+     *    e.g. non-Chrome browser or insecure HTTP context on non-localhost).
      */
-    console.log('[Translation] Starting server-side STT (legacy PCM path) with target language:', resolvedTargetLanguage);
-    await this.startLegacyRecording(socket, callId, language, onError, existingStream, sttMode);
+    const hasBrowserSTT = !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+
+    if (hasBrowserSTT && sttMode === 'speaker') {
+      // Use browser STT directly — most reliable path for voice translation.
+      // Browser captures mic → recognizes speech → sends text via call:speech →
+      // server translates (DeepL/Google) + TTS (Sarvam/Google) → other user hears translated audio.
+      console.log('[Translation] Using BROWSER STT (primary) — speech → call:speech → server translate + TTS');
+      this.browserSttActive = true;
+      await this.startBrowserRecording(socket, callId, resolvedTargetLanguage, onError);
+    } else {
+      // Fallback: server-side STT via PCM audio chunks → Whisper
+      console.log('[Translation] Browser STT not available, using server-side STT (legacy PCM path)');
+      this.browserSttActive = false;
+      await this.startLegacyRecording(socket, callId, language, onError, existingStream, sttMode);
+    }
   }
 
   /**
@@ -386,6 +398,76 @@ export class TranslationService {
     this.browserRecognition = recognition;
     this.isActive = true;
     console.log(`[BrowserSTT] Started speech recognition for call ${callId}, target language: ${targetLanguage}`);
+  }
+
+  /**
+   * PUBLIC fallback: Start browser SpeechRecognition when server-side Whisper STT fails.
+   * This captures the user's mic via the browser's built-in speech recognition (free, no API key),
+   * then sends recognized text via `call:speech` to the server for translation + TTS.
+   *
+   * The server's `call:speech` handler translates using DeepL/Google (no OpenAI needed)
+   * and generates TTS via Sarvam/ElevenLabs/Google, then sends `call:translated-text` back.
+   */
+  startBrowserSttFallback(socket: Socket, callId: string, targetLanguage: string): void {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn('[BrowserSTT Fallback] SpeechRecognition not supported in this browser');
+      return;
+    }
+    // Stop any existing legacy/Whisper recording first
+    this.legacyIsRecording = false;
+    if (this.legacyScriptProcessor) {
+      this.legacyScriptProcessor.onaudioprocess = null;
+      try { this.legacyScriptProcessor.disconnect(); } catch {}
+    }
+
+    console.log(`[BrowserSTT Fallback] Starting browser speech recognition as Whisper fallback for call ${callId}`);
+    this.activeSocket = socket;
+    this.activeCallId = callId;
+    this.browserSttActive = true;
+    this.startBrowserRecording(socket, callId, targetLanguage);
+  }
+
+  /** Check if browser STT is currently running as the primary/fallback STT */
+  isBrowserSttRunning(): boolean {
+    return this.browserSttActive && this.browserRecognition !== null;
+  }
+
+  /**
+   * Stop ONLY the legacy/Whisper recording without touching browser STT.
+   * Used when falling back from Whisper to browser STT to avoid killing the fallback.
+   */
+  stopLegacyOnly(socket?: Socket | null, callId?: string): void {
+    // Stop listener-mode recording
+    this.stopListenerRecording(socket, callId);
+
+    // Stop legacy PCM recording
+    this.legacyIsRecording = false;
+    if (this.legacyScriptProcessor) {
+      this.legacyScriptProcessor.onaudioprocess = null;
+      try { this.legacyScriptProcessor.disconnect(); } catch {}
+      this.legacyScriptProcessor = null;
+    }
+    if (this.legacyMicSource) {
+      try { this.legacyMicSource.disconnect(); } catch {}
+      this.legacyMicSource = null;
+    }
+    if (this.legacyAudioContext) {
+      this.legacyAudioContext.close().catch(() => {});
+      this.legacyAudioContext = null;
+    }
+    if (this.legacyMicStream) {
+      if (!this.legacyIsShared) {
+        this.legacyMicStream.getTracks().forEach((t) => t.stop());
+      }
+      this.legacyMicStream = null;
+      this.legacyIsShared = false;
+    }
+
+    if (socket && callId) {
+      socket.emit('call:stop-stt', { callId });
+    }
+    console.log('[Translation] Stopped legacy/Whisper recording (browser STT preserved)');
   }
 
   /**
@@ -679,6 +761,7 @@ export class TranslationService {
     this.stopListenerRecording(socket, callId);
 
     // Stop Browser SpeechRecognition
+    this.browserSttActive = false;
     if (this.browserRecognition) {
       try {
         this.browserRecognition.onend = null; // Prevent auto-restart

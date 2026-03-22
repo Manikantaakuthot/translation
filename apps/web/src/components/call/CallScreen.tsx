@@ -771,16 +771,33 @@ export default function CallScreen() {
 
     const onSttError = (data: { callId: string; error: string }) => {
       if (data.callId === activeCall.callId) {
-        console.error('[Translation] Server STT error:', data.error);
-        logVoiceStage('stt_error', { error: data.error });
-        setSttStatus('error');
-        setSttError(data.error);
+        console.warn('[Translation] Server STT error:', data.error);
+        // If browser STT is already the primary method, ignore server-side Whisper errors
+        // (they come from listener-mode PCM which we don't need when using browser STT)
+        if (translationService.isBrowserSttRunning()) {
+          console.log('[Translation] Browser STT already active as primary — ignoring server STT error');
+          return;
+        }
+        console.log('[Translation] Falling back to browser STT...');
+        logVoiceStage('stt_error_fallback', { error: data.error, action: 'browser_stt_fallback' });
+        // Stop ONLY the legacy/Whisper recording, NOT browser STT
+        translationService.stopLegacyOnly(socket, activeCall.callId);
+        translationService.startBrowserSttFallback(socket, activeCall.callId, callLang);
+        setSttStatus('listening');
+        console.log('[Translation] Browser STT fallback active — no OpenAI key needed');
+      }
+    };
+
+    const onSttFallback = (data: { callId: string; engine: string; reason: string }) => {
+      if (data.callId === activeCall.callId) {
+        console.log(`[Translation] Server switched STT to ${data.engine}: ${data.reason}`);
       }
     };
 
     socket.on('call:stt-started', onSttStarted);
     socket.on('call:stt-transcript', onSttTranscript);
     socket.on('call:stt-error', onSttError);
+    socket.on('call:stt-fallback', onSttFallback);
 
     // Check STT support
     const support = TranslationService.isSupported();
@@ -819,21 +836,31 @@ export default function CallScreen() {
           );
 
           // ─── LISTENER MODE: Capture REMOTE stream → translate → play on MY device ───
-          // This is the KEY: User B hears User A's speech translated into User B's language
-          const remoteStream = remoteStreamRef.current;
-          if (remoteStream && remoteStream.getAudioTracks().length > 0) {
-            console.log(`[Translation] Starting LISTENER mode STT (remote stream → translate → play on my device)`);
-            await translationService.startListenerRecording(
-              socket,
-              activeCall.callId,
-              remoteStream,
-              'auto',
-              (error) => {
-                console.warn('[Translation] Listener recording error:', error);
-              },
-            );
+          // NOTE: When browser STT is the primary mode, listener mode is NOT needed.
+          // Each user's SPEAKER mode (browser STT) captures their own mic → sends via call:speech
+          // → server translates + TTS → other user hears it. So User A's speaker mode
+          // handles translating User A's speech for User B, and vice versa.
+          //
+          // Listener mode (remote stream → Whisper) is only needed when using server-side STT
+          // as a backup for when browser STT is unavailable.
+          if (!translationService.isBrowserSttRunning()) {
+            const remoteStream = remoteStreamRef.current;
+            if (remoteStream && remoteStream.getAudioTracks().length > 0) {
+              console.log(`[Translation] Starting LISTENER mode STT (remote stream → translate → play on my device)`);
+              await translationService.startListenerRecording(
+                socket,
+                activeCall.callId,
+                remoteStream,
+                'auto',
+                (error) => {
+                  console.warn('[Translation] Listener recording error:', error);
+                },
+              );
+            } else {
+              console.warn('[Translation] Remote stream not ready yet — listener mode will start when stream arrives');
+            }
           } else {
-            console.warn('[Translation] Remote stream not ready yet — listener mode will start when stream arrives');
+            console.log('[Translation] Browser STT is primary — skipping listener mode (speaker mode on each device handles translation)');
           }
 
           if (cancelled || !translationActiveRef.current) {
@@ -859,6 +886,7 @@ export default function CallScreen() {
       socket.off('call:stt-started', onSttStarted);
       socket.off('call:stt-transcript', onSttTranscript);
       socket.off('call:stt-error', onSttError);
+      socket.off('call:stt-fallback', onSttFallback);
     };
   }, [translationActive, callStatus, activeCall?.callId, socket, callLang]);
 
@@ -875,8 +903,14 @@ export default function CallScreen() {
 
   // Start listener-mode STT when remote stream becomes available AND translation is active
   // Handles the case where user toggled translation before the remote stream arrived
+  // NOTE: Skip if browser STT is primary — each user's speaker mode handles their own speech
   useEffect(() => {
     if (!translationActive || !remoteStreamReady || !activeCall || !socket) return;
+    // When browser STT is the primary mode, listener mode is redundant
+    if (translationService.isBrowserSttRunning()) {
+      console.log('[Translation] Browser STT is primary — skipping listener mode start on remote stream ready');
+      return;
+    }
     const remoteStream = remoteStreamRef.current;
     if (!remoteStream || remoteStream.getAudioTracks().length === 0) return;
 

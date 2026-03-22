@@ -984,17 +984,12 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       const isQuotaError = err?.status === 429 || err?.code === 'insufficient_quota';
       console.error(`[Whisper STT] Transcription error (quota: ${isQuotaError}):`, err?.message || err);
 
-      if (isQuotaError) {
-        // OpenAI quota exceeded — fall back to ElevenLabs STT permanently for this session
-        console.log(`[Whisper STT] OpenAI quota exceeded, switching to ElevenLabs STT for session ${sessionKey}`);
-        this.whisperBuffers.delete(sessionKey);
-
-        // Start ElevenLabs STT session as fallback
-        this.handleStartStt(client, { callId, language: language || 'auto', sttMode: sttMode as any });
-        client.emit('call:stt-fallback', { callId, engine: 'elevenlabs', reason: 'OpenAI quota exceeded' });
-      } else {
-        client.emit('call:stt-error', { callId, error: 'Whisper transcription failed' });
-      }
+      // On ANY Whisper failure: clean up buffer and tell client to use browser STT fallback.
+      // The client will start browser SpeechRecognition and send text via call:speech,
+      // which we translate + TTS without needing OpenAI at all.
+      console.log(`[Whisper STT] Whisper failed for session ${sessionKey}, telling client to use browser STT`);
+      this.whisperBuffers.delete(sessionKey);
+      client.emit('call:stt-error', { callId, error: 'Whisper transcription failed — switching to browser STT' });
     }
   }
 
@@ -1200,7 +1195,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       });
     } catch (err: any) {
       console.error(`[Whisper STT Listener] Error:`, err?.message || err);
-      client.emit('call:stt-error', { callId, error: 'Listener transcription failed' });
+      // Clean up listener buffer so it doesn't keep retrying
+      this.listenerWhisperBuffers.delete(sessionKey);
+      client.emit('call:stt-error', { callId, error: 'Listener transcription failed — using browser STT' });
     }
   }
 
