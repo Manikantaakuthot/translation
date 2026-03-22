@@ -1,0 +1,15 @@
+{
+  "name": "@msg/desktop",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:dev": "cross-env NODE_ENV=development electron .",
+    "build": "npm run build -w @msg/web"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "cross-env": "^7.0.3"
+  }
+}

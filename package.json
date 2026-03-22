@@ -1,0 +1,35 @@
+{
+  "name": "msg-whatsapp-clone",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev -w @msg/api",
+    "dev:web": "npm run dev -w @msg/web",
+    "dev:web2": "VITE_PORT=5174 npm run dev -w @msg/web",
+    "dev:web3": "VITE_PORT=5175 npm run dev -w @msg/web",
+    "build": "npm run build -w @msg/api && npm run build -w @msg/web",
+    "test:e2e": "npm run test:e2e -w @msg/web",
+    "install:all": "npm install && npm install -w @msg/api && npm install -w @msg/web"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.13.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "jest": "^30.3.0",
+    "microsoft-cognitiveservices-speech-sdk": "^1.48.0",
+    "openai": "^6.32.0",
+    "uuid": "^13.0.0",
+    "ws": "^8.19.0"
+  }
+}

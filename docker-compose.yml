@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: msg-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: msg
+
+  redis:
+    image: redis:7-alpine
+    container_name: msg-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: msg-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      PORT: 3000
+      MONGODB_URI: mongodb://mongodb:27017/msg
+      REDIS_URI: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      API_URL: http://localhost:3000
+      CORS_ORIGIN: http://localhost:5173
+      OTP_DEV_MODE: "true"
+      SERVER_URL: http://localhost:3000
+    volumes:
+      - api_uploads:/app/uploads
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: msg-web
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  mongodb_data:
+  redis_data:
+  api_uploads:
