@@ -93,8 +93,9 @@ async function main() {
       });
     });
 
-    // Set speaker's preferred target language for this call.
-    socket1.emit('call:update-language', { callId, language: 'kn' });
+    // Set RECEIVER's preferred target language for this call.
+    // Rule: each listener hears incoming speech in their selected language.
+    socket2.emit('call:update-language', { callId, language: 'kn' });
     await new Promise((r) => setTimeout(r, 500));
 
     socket1.emit('call:speech', {
@@ -104,6 +105,9 @@ async function main() {
     console.log('sent call:speech from user1');
 
     const translated = await translatedPromise;
+    if (translated.targetLanguage !== 'kn') {
+      throw new Error(`Expected targetLanguage=kn but got ${translated.targetLanguage}`);
+    }
     console.log('\n=== TRANSLATION OUTPUT ===');
     console.log(JSON.stringify(translated, null, 2));
   } finally {

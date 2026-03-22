@@ -41,6 +41,8 @@ export interface TranslationCallbacks {
 export class TranslationService {
   private conversation: any = null; // Conversation instance from @elevenlabs/client
   private isActive = false;
+  private lastSpeakerChunkLogAt = 0;
+  private lastListenerChunkLogAt = 0;
 
   // Browser SpeechRecognition instance
   private browserRecognition: any = null;
@@ -65,6 +67,15 @@ export class TranslationService {
 
   // Prevent TTS backlog from growing (keeps translation feeling real-time)
   private readonly MAX_AUDIO_QUEUE_SIZE = 2;
+
+  private logStage(stage: string, callId: string, details?: Record<string, any>) {
+    const payload = details
+      ? Object.entries(details)
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(' ')
+      : '';
+    console.log(`[voice_stage_client] ${stage} callId=${callId}${payload ? ` ${payload}` : ''}`);
+  }
 
   /** Get or create a shared AudioContext for playback — awaits resume if suspended */
   private async getPlaybackContext(): Promise<AudioContext> {
@@ -494,6 +505,7 @@ export class TranslationService {
     }
 
     console.log('[TranslationListener] Starting listener-mode STT for remote stream');
+    this.logStage('stt_start_request', callId, { mode: 'listener' });
     socket.emit('call:start-whisper-stt-listener', { callId, language, sttMode: 'listener' });
 
     try {
@@ -526,6 +538,11 @@ export class TranslationService {
         const bytes = new Uint8Array(pcm16.buffer);
         let binary = '';
         for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const now = Date.now();
+        if (now - this.lastListenerChunkLogAt > 2000) {
+          this.logStage('audio_chunk_tx', callId, { mode: 'listener', bytes: bytes.length });
+          this.lastListenerChunkLogAt = now;
+        }
         socket.emit('call:audio-chunk-listener', { callId, audio: btoa(binary) });
       };
 
@@ -607,6 +624,7 @@ export class TranslationService {
       this.isActive = true;
       this.legacyIsRecording = true;
       console.log('[TranslationService] Emitting call:start-whisper-stt', { callId, language, sttMode });
+      this.logStage('stt_start_request', callId, { mode: sttMode, language });
       socket.emit('call:start-whisper-stt', { callId, language, sttMode });
 
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -637,6 +655,11 @@ export class TranslationService {
         const bytes = new Uint8Array(pcm16.buffer);
         let binary = '';
         for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const now = Date.now();
+        if (now - this.lastSpeakerChunkLogAt > 2000) {
+          this.logStage('audio_chunk_tx', callId, { mode: sttMode, bytes: bytes.length });
+          this.lastSpeakerChunkLogAt = now;
+        }
         socket.emit('call:audio-chunk', { callId, audio: btoa(binary) });
       };
 
@@ -720,6 +743,13 @@ export class TranslationService {
       this.audioQueue.shift();
     }
     console.log(`[TTS] Enqueued audio (queue size: ${this.audioQueue.length}, text: "${text?.substring(0, 30) || ''}", lang: ${language})`);
+    if (this.activeCallId) {
+      this.logStage('translated_receive', this.activeCallId, {
+        audioBytes: base64Audio ? Math.floor((base64Audio.length * 3) / 4) : 0,
+        queueSize: this.audioQueue.length,
+        language: language || 'en',
+      });
+    }
 
     if (!this.isPlayingQueue) {
       this.processAudioQueue();

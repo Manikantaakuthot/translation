@@ -100,6 +100,7 @@ export default function CallScreen() {
   const [sttError, setSttError] = useState('');
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [langChangeToast, setLangChangeToast] = useState('');
+  const translationPlaybackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Connection quality state
   const [connectionQuality, setConnectionQuality] = useState<'excellent' | 'good' | 'poor' | 'disconnected'>('good');
@@ -107,6 +108,8 @@ export default function CallScreen() {
   // Ref to avoid stale closure for currentUser.id in socket listeners
   const currentUserIdRef = useRef(currentUser?.id);
   currentUserIdRef.current = currentUser?.id;
+  const isRemoteSpeakingRef = useRef(false);
+  isRemoteSpeakingRef.current = isRemoteSpeaking;
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -168,6 +171,16 @@ export default function CallScreen() {
     const m = Math.floor(s / 60);
     const sec = s % 60;
     return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+  };
+
+  const logVoiceStage = (stage: string, details?: Record<string, any>) => {
+    const callId = activeCall?.callId || 'none';
+    const payload = details
+      ? Object.entries(details)
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(' ')
+      : '';
+    console.log(`[voice_stage_client] ${stage} callId=${callId}${payload ? ` ${payload}` : ''}`);
   };
 
 
@@ -300,12 +313,12 @@ export default function CallScreen() {
     const applyRemoteAudioState = () => {
       const audioEl = remoteAudioRef.current;
       if (!audioEl) return;
-      const translationOn = translationActiveRef.current;
-      // Avoid hearing both original remote audio and translated TTS at once.
-      audioEl.muted = translationOn;
-      audioEl.volume = translationOn ? 0 : 1.0;
+      const muteForTranslation = translationActiveRef.current && isRemoteSpeakingRef.current;
+      // Fail-safe: keep original call audio audible unless translated playback is active.
+      audioEl.muted = muteForTranslation;
+      audioEl.volume = muteForTranslation ? 0 : 1.0;
       console.log(
-        `[Translation] Remote audio state: muted=${audioEl.muted} vol=${audioEl.volume} (translation=${translationOn ? 'ON' : 'OFF'})`,
+        `[Translation] Remote audio state: muted=${audioEl.muted} vol=${audioEl.volume} (translation=${translationActiveRef.current ? 'ON' : 'OFF'} speaking=${isRemoteSpeakingRef.current ? 'YES' : 'NO'})`,
       );
     };
 
@@ -317,6 +330,7 @@ export default function CallScreen() {
 
       // Remote stream arriving = call is working, set connected status (only if answered)
       if (callAnsweredRef.current) setCallStatus('connected');
+      logVoiceStage('webrtc_connected', { remoteAudioTracks: audioTracks.length });
 
       // Use the persistent <audio> element rendered in JSX (avoids autoplay policy issues)
       const audioEl = remoteAudioRef.current;
@@ -329,6 +343,7 @@ export default function CallScreen() {
         const tryPlay = (attempt: number) => {
           audioEl.play().then(() => {
             console.log('[CallScreen] Audio element playing (attempt', attempt, ')');
+            logVoiceStage('remote_audio_playing', { attempt });
           }).catch((err: any) => {
             console.warn('[CallScreen] Audio play attempt', attempt, 'failed:', err.message);
             if (attempt < 5) {
@@ -384,6 +399,7 @@ export default function CallScreen() {
 
       peer.on('connect', () => {
         console.log('[CallScreen] Peer connected!');
+        logVoiceStage('peer_connected');
         if (iceTimeoutRef.current) {
           clearTimeout(iceTimeoutRef.current);
           iceTimeoutRef.current = null;
@@ -550,11 +566,20 @@ export default function CallScreen() {
       }
 
       console.log('[Translation] Received:', data.translatedText, 'lang:', data.targetLanguage, 'hasAudio:', !!data.audioBase64, 'audioSize:', data.audioBase64?.length || 0);
+      logVoiceStage('translated_receive', {
+        fromUserId: data.fromUserId,
+        targetLanguage: data.targetLanguage,
+        audioBytes: data.audioBase64 ? Math.floor((data.audioBase64.length * 3) / 4) : 0,
+      });
       setHasReceivedTranslation(true);
       setIsRemoteSpeaking(true);
 
       const onPlaybackEnd = () => {
         console.log('[Translation] TTS playback finished');
+        if (translationPlaybackTimeoutRef.current) {
+          clearTimeout(translationPlaybackTimeoutRef.current);
+          translationPlaybackTimeoutRef.current = null;
+        }
         setIsRemoteSpeaking(false);
       };
 
@@ -564,6 +589,11 @@ export default function CallScreen() {
       } else {
         translationService.speak(data.translatedText, data.targetLanguage, onPlaybackEnd);
       }
+      // Safety release: never keep raw call audio muted indefinitely.
+      if (translationPlaybackTimeoutRef.current) clearTimeout(translationPlaybackTimeoutRef.current);
+      translationPlaybackTimeoutRef.current = setTimeout(() => {
+        setIsRemoteSpeaking(false);
+      }, 7000);
     };
 
     const onLanguageChanged = (data: { callId: string; userId: string; language: string }) => {
@@ -697,6 +727,10 @@ export default function CallScreen() {
       socket.off('call:translated-text', onTranslatedText);
       socket.off('call:language-changed', onLanguageChanged);
       translationService.stopSpeaking();
+      if (translationPlaybackTimeoutRef.current) {
+        clearTimeout(translationPlaybackTimeoutRef.current);
+        translationPlaybackTimeoutRef.current = null;
+      }
       cleanup();
     };
   }, [activeCall?.callId, socket]);
@@ -710,8 +744,43 @@ export default function CallScreen() {
       if (!translationActive) setSttStatus('off');
       return;
     }
+    if (callStatus !== 'connected') {
+      setSttStatus('starting');
+      return;
+    }
 
     let cancelled = false;
+
+    const onSttStarted = (data: { callId: string }) => {
+      if (data.callId === activeCall.callId) {
+        console.log('[Translation] Server confirmed STT started');
+        logVoiceStage('stt_started');
+        setSttStatus('listening');
+      }
+    };
+
+    const onSttTranscript = (data: { callId: string; text: string; isFinal: boolean }) => {
+      if (data.callId === activeCall.callId) {
+        setSttStatus('listening');
+        if (data.isFinal && data.text.trim()) {
+          console.log('[Translation] Final transcript:', data.text);
+          logVoiceStage('transcript_final', { chars: data.text.trim().length });
+        }
+      }
+    };
+
+    const onSttError = (data: { callId: string; error: string }) => {
+      if (data.callId === activeCall.callId) {
+        console.error('[Translation] Server STT error:', data.error);
+        logVoiceStage('stt_error', { error: data.error });
+        setSttStatus('error');
+        setSttError(data.error);
+      }
+    };
+
+    socket.on('call:stt-started', onSttStarted);
+    socket.on('call:stt-transcript', onSttTranscript);
+    socket.on('call:stt-error', onSttError);
 
     // Check STT support
     const support = TranslationService.isSupported();
@@ -725,6 +794,7 @@ export default function CallScreen() {
         try {
           if (cancelled || !translationActiveRef.current) return;
           translationService.warmupAudioContext();
+          logVoiceStage('stt_start_request', { mode: 'speaker+listener', targetLanguage: callLang });
 
           // ─── SPEAKER MODE: Translate MY speech for the other user ───
           console.log(`[Translation] Starting SPEAKER mode STT (my mic → translate → send to other user)`);
@@ -780,34 +850,6 @@ export default function CallScreen() {
       })();
     }
 
-    const onSttStarted = (data: { callId: string }) => {
-      if (data.callId === activeCall.callId) {
-        console.log('[Translation] Server confirmed STT started');
-        setSttStatus('listening');
-      }
-    };
-
-    const onSttTranscript = (data: { callId: string; text: string; isFinal: boolean }) => {
-      if (data.callId === activeCall.callId) {
-        setSttStatus('listening');
-        if (data.isFinal && data.text.trim()) {
-          console.log('[Translation] Final transcript:', data.text);
-        }
-      }
-    };
-
-    const onSttError = (data: { callId: string; error: string }) => {
-      if (data.callId === activeCall.callId) {
-        console.error('[Translation] Server STT error:', data.error);
-        setSttStatus('error');
-        setSttError(data.error);
-      }
-    };
-
-    socket.on('call:stt-started', onSttStarted);
-    socket.on('call:stt-transcript', onSttTranscript);
-    socket.on('call:stt-error', onSttError);
-
     return () => {
       cancelled = true;
       // Cancel any in-flight async start logic
@@ -856,19 +898,26 @@ export default function CallScreen() {
   useEffect(() => {
     translationActiveRef.current = translationActive;
     if (remoteAudioRef.current) {
-      remoteAudioRef.current.muted = translationActive;
-      remoteAudioRef.current.volume = translationActive ? 0 : 1.0;
+      const muteForTranslation = translationActive && isRemoteSpeaking;
+      remoteAudioRef.current.muted = muteForTranslation;
+      remoteAudioRef.current.volume = muteForTranslation ? 0 : 1.0;
       console.log(
         `[Translation] Remote audio state updated ` +
         `(muted=${remoteAudioRef.current.muted}, vol=${remoteAudioRef.current.volume}) ` +
-        `(translation=${translationActive ? 'ON' : 'OFF'})`,
+        `(translation=${translationActive ? 'ON' : 'OFF'} speaking=${isRemoteSpeaking ? 'YES' : 'NO'})`,
       );
     }
-  }, [translationActive]);
+  }, [translationActive, isRemoteSpeaking]);
 
   const handleToggleTranslation = () => {
     const hasBrowserSTT = !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
     console.log(`[Translation] Toggle: active=${translationActive}→${!translationActive}, callStatus=${callStatus}, lang=${callLang}, browserSTT=${hasBrowserSTT}`);
+    logVoiceStage('translation_toggle', {
+      from: translationActive ? 'on' : 'off',
+      to: !translationActive ? 'on' : 'off',
+      callStatus,
+      language: callLang,
+    });
     if (translationActive) {
       // Update ref immediately so incoming translated events are ignored instantly.
       translationActiveRef.current = false;
@@ -889,6 +938,8 @@ export default function CallScreen() {
       if (socket && activeCall) {
         socket.emit('call:update-language', { callId: activeCall.callId, language: callLang });
       }
+      setSttStatus(callStatus === 'connected' ? 'starting' : 'off');
+      setSttError('');
       setHasReceivedTranslation(false);
       setTranslationActive(true);
     }

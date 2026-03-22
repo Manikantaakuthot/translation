@@ -49,6 +49,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     string,
     { text: string; firstAt: number; sourceLanguage?: string; flushTimer?: ReturnType<typeof setTimeout> }
   >(); // sessionKey -> buffered final transcript fragments (improves MT accuracy)
+  private audioChunkLogAt = new Map<string, number>(); // sessionKey -> last sampled audio-chunk log timestamp
 
   /** Unicode script regex map for language validation */
   private static readonly SCRIPT_MAP: Record<string, RegExp> = {
@@ -111,6 +112,11 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     const socketCount = this.userSockets.get(userId)?.size || 0;
     this.server.to(`user:${userId}`).emit(event, data);
     console.log(`[Socket] Emitted ${event} to room user:${userId} (sockets: ${socketCount})`);
+    if (event === 'call:translated-text') {
+      console.log(
+        `[voice_stage] translated_emit event=call:translated-text callId=${data?.callId} fromUserId=${data?.fromUserId} receiverUserId=${userId} targetLanguage=${data?.targetLanguage} audioBytes=${data?.audioBase64 ? Math.floor((data.audioBase64.length * 3) / 4) : 0}`,
+      );
+    }
   }
 
   constructor(
@@ -474,6 +480,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
 
     console.log(`[STT] Starting ElevenLabs STT for user ${userId}, call ${data.callId}, lang ${data.language}`);
+    console.log(
+      `[voice_stage] stt_started engine=elevenlabs callId=${data.callId} userId=${userId} sttMode=${sttMode} language=${data.language}`,
+    );
 
     try {
       // Find the other user for this call
@@ -503,6 +512,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
           });
 
           if (isFinal && text.trim()) {
+            console.log(
+              `[voice_stage] transcript_final engine=elevenlabs callId=${data.callId} userId=${userId} chars=${text.trim().length} detected=${detectedLanguage || 'unknown'}`,
+            );
             // Skip very short transcripts (garbled echo fragments)
             if (text.trim().length < 3) {
               console.log(`[STT] Skipping too-short transcript: "${text}"`);
@@ -599,11 +611,17 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
               const result = await this.translationService.translateText(finalText, targetLanguage, finalSourceLanguage);
               console.log(`[STT→Translate] "${finalText}" → "${result.translatedText}" (${targetLanguage})`);
+              console.log(
+                `[voice_stage] translation_done engine=elevenlabs callId=${data.callId} userId=${userId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} srcChars=${finalText.length} dstChars=${result.translatedText.length}`,
+              );
 
               let audioBase64: string | undefined;
               try {
                 const audioBuffer = await this.translationService.textToSpeech(result.translatedText, targetLanguage);
                 audioBase64 = audioBuffer.toString('base64');
+                console.log(
+                  `[voice_stage] tts_done engine=elevenlabs callId=${data.callId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} audioBytes=${audioBuffer.length}`,
+                );
               } catch (ttsErr) {
                 console.error('[STT→TTS] TTS failed:', ttsErr);
               }
@@ -673,6 +691,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     if (!userId || !data?.callId || !data?.audio) return;
 
     const sessionKey = `${userId}:${data.callId}`;
+    const now = Date.now();
+    const lastLogAt = this.audioChunkLogAt.get(sessionKey) || 0;
+    if (now - lastLogAt > 2000) {
+      console.log(
+        `[voice_stage] audio_chunk_rx callId=${data.callId} userId=${userId} sessionKey=${sessionKey} base64Chars=${data.audio.length}`,
+      );
+      this.audioChunkLogAt.set(sessionKey, now);
+    }
 
     // Half-duplex: don't forward audio to STT while TTS is playing on this user's device
     if (this.pausedSttSessions.has(sessionKey)) return;
@@ -794,6 +820,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     if (existingBuf?.timer) clearTimeout(existingBuf.timer);
 
     console.log(`[Whisper STT] Starting for user ${userId}, call ${data.callId}, lang ${data.language}`);
+    console.log(
+      `[voice_stage] stt_started engine=whisper callId=${data.callId} userId=${userId} sttMode=${sttMode} language=${data.language}`,
+    );
 
     this.whisperBuffers.set(sessionKey, {
       chunks: [],
@@ -872,6 +901,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       }
 
       console.log(`[Whisper STT] Transcript: "${result.text}" (detected: ${result.detectedLanguage})`);
+      console.log(
+        `[voice_stage] transcript_final engine=whisper callId=${callId} userId=${userId} chars=${result.text.trim().length} detected=${result.detectedLanguage || language || 'unknown'}`,
+      );
 
       // Send transcript to client for display
       client.emit('call:stt-transcript', {
@@ -919,12 +951,18 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       // Translate
       const translation = await this.translationService.translateText(result.text, targetLanguage, detectedLang);
       console.log(`[Whisper→Translate] "${result.text}" → "${translation.translatedText}" (${targetLanguage})`);
+      console.log(
+        `[voice_stage] translation_done engine=whisper callId=${callId} userId=${userId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} srcChars=${result.text.length} dstChars=${translation.translatedText.length}`,
+      );
 
       // TTS
       let ttsAudioBase64: string | undefined;
       try {
         const ttsBuffer = await this.translationService.textToSpeech(translation.translatedText, targetLanguage);
         ttsAudioBase64 = ttsBuffer.toString('base64');
+        console.log(
+          `[voice_stage] tts_done engine=whisper callId=${callId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} audioBytes=${ttsBuffer.length}`,
+        );
       } catch (ttsErr) {
         console.error('[Whisper→TTS] TTS failed:', ttsErr);
       }
@@ -993,6 +1031,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     if (existingBuf?.timer) clearTimeout(existingBuf.timer);
 
     console.log(`[Whisper STT Listener] Starting for user ${userId}, call ${data.callId}`);
+    console.log(
+      `[voice_stage] stt_started engine=whisper-listener callId=${data.callId} userId=${userId} mode=listener language=${data.language}`,
+    );
 
     this.listenerWhisperBuffers.set(sessionKey, {
       chunks: [],
@@ -1012,6 +1053,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     if (!userId || !data?.callId || !data?.audio) return;
 
     const sessionKey = `listener:${userId}:${data.callId}`;
+    const now = Date.now();
+    const lastLogAt = this.audioChunkLogAt.get(sessionKey) || 0;
+    if (now - lastLogAt > 2000) {
+      console.log(
+        `[voice_stage] audio_chunk_rx callId=${data.callId} userId=${userId} sessionKey=${sessionKey} base64Chars=${data.audio.length} mode=listener`,
+      );
+      this.audioChunkLogAt.set(sessionKey, now);
+    }
 
     // Half-duplex: don't process while TTS is playing on this user's device
     if (this.pausedSttSessions.has(sessionKey)) return;
@@ -1075,6 +1124,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       if (!result.text.trim() || result.text.trim().length < 2) return;
 
       console.log(`[Whisper STT Listener] Transcript: "${result.text}" (detected: ${result.detectedLanguage})`);
+      console.log(
+        `[voice_stage] transcript_final engine=whisper-listener callId=${callId} userId=${userId} chars=${result.text.trim().length} detected=${result.detectedLanguage || language || 'unknown'}`,
+      );
 
       // Find the other user in the call (the speaker whose voice we captured)
       const call = await this.callModel.findById(callId).lean();
@@ -1116,12 +1168,18 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       // Translate
       const translation = await this.translationService.translateText(result.text, targetLanguage, detectedLang);
       console.log(`[Whisper Listener→Translate] "${result.text}" → "${translation.translatedText}" (${targetLanguage})`);
+      console.log(
+        `[voice_stage] translation_done engine=whisper-listener callId=${callId} userId=${userId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} srcChars=${result.text.length} dstChars=${translation.translatedText.length}`,
+      );
 
       // TTS
       let ttsAudioBase64: string | undefined;
       try {
         const ttsBuffer = await this.translationService.textToSpeech(translation.translatedText, targetLanguage);
         ttsAudioBase64 = ttsBuffer.toString('base64');
+        console.log(
+          `[voice_stage] tts_done engine=whisper-listener callId=${callId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} audioBytes=${ttsBuffer.length}`,
+        );
       } catch (ttsErr) {
         console.error('[Whisper Listener→TTS] TTS failed:', ttsErr);
       }
