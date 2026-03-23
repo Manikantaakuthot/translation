@@ -466,220 +466,10 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     @ConnectedSocket() client: any,
     @MessageBody() data: { callId: string; language: string; sttMode?: 'speaker' | 'listener' },
   ) {
-    const userId = client.userId;
-    if (!userId || !data?.callId) return;
-
-    const sessionKey = `${userId}:${data.callId}`;
-    const sttMode = data.sttMode || 'speaker';
-
-    // Close existing session if any
-    const existing = this.sttSessions.get(sessionKey);
-    if (existing) {
-      existing.close();
-      this.sttSessions.delete(sessionKey);
-    }
-
-    console.log(`[STT] Starting ElevenLabs STT for user ${userId}, call ${data.callId}, lang ${data.language}`);
-    console.log(
-      `[voice_stage] stt_started engine=elevenlabs callId=${data.callId} userId=${userId} sttMode=${sttMode} language=${data.language}`,
-    );
-
-    try {
-      // Find the other user for this call
-      const call = await this.callModel.findById(data.callId).lean();
-      if (!call) return;
-
-      const otherUserId =
-        (call as any).callerId.toString() === userId
-          ? (call as any).calleeId.toString()
-          : (call as any).callerId.toString();
-
-      // Who should receive the TTS audio?
-      // - speaker mode: translate THIS user's audio → send to OTHER participant
-      // - listener mode: translate remote audio captured on THIS device → send back to THIS user
-      const receiverUserId = sttMode === 'listener' ? userId : otherUserId;
-      // What should `fromUserId` mean on the client?
-      // It's the "speaker" whose voice was translated.
-      const fromUserIdForClient = sttMode === 'listener' ? otherUserId : userId;
-
-      const session = this.elevenlabsService.createSttWebSocket(data.language, {
-        onTranscript: async (text: string, isFinal: boolean, detectedLanguage?: string, avgLogprob?: number) => {
-          // Send partial transcripts back to the speaker for display
-          client.emit('call:stt-transcript', {
-            callId: data.callId,
-            text,
-            isFinal,
-          });
-
-          if (isFinal && text.trim()) {
-            console.log(
-              `[voice_stage] transcript_final engine=elevenlabs callId=${data.callId} userId=${userId} chars=${text.trim().length} detected=${detectedLanguage || 'unknown'}`,
-            );
-            // Skip very short transcripts (garbled echo fragments)
-            if (text.trim().length < 3) {
-              console.log(`[STT] Skipping too-short transcript: "${text}"`);
-              return;
-            }
-
-            // Confidence-based filtering — low logprob = likely garbage/echo, not real speech.
-            // We keep it permissive for "ultra smooth" translation so we don't drop real sentences.
-            const minAvgLogprob = Number(process.env.STT_MIN_AVG_LOGPROB ?? '-7.0');
-            if (avgLogprob !== undefined && avgLogprob < minAvgLogprob && text.trim().length < 12) {
-              console.log(`[STT] Low confidence transcript (logprob: ${avgLogprob.toFixed(2)}), discarding short: "${text}"`);
-              return;
-            }
-
-            // Skip transcripts during TTS cooldown (best-effort echo prevention)
-            const ttsCooldownMs = Number(process.env.STT_TTS_COOLDOWN_MS ?? '2500');
-            const lastTts = this.ttsCooldowns.get(userId) || 0;
-            if (Date.now() - lastTts < ttsCooldownMs) {
-              console.log(`[STT] Ignoring transcript from ${userId} — TTS cooldown active (echo prevention)`);
-              return;
-            }
-
-            // Textual echo cancellation — if transcript matches recent TTS text, it's the mic picking up TTS audio
-            const lastTtsText = this.lastTtsText.get(userId);
-            if (lastTtsText && this.isSimilarText(text, lastTtsText)) {
-              console.log(`[STT] Discarding textual echo from ${userId} — transcript "${text}" matches recent TTS "${lastTtsText}"`);
-              this.lastTtsText.delete(userId); // Clear after one match
-              return;
-            }
-
-            const minUtteranceChars = Number(process.env.STT_MIN_UTTERANCE_CHARS ?? '25');
-            const maxBufferMs = Number(process.env.STT_MAX_UTTERANCE_BUFFER_MS ?? '1200');
-            const detectedSource = (detectedLanguage && detectedLanguage !== 'unknown') ? detectedLanguage : undefined;
-
-            // Buffer short "final" fragments into a bigger utterance for better translation accuracy.
-            const existingBuf = this.sttUtteranceBuffers.get(sessionKey);
-            if (!existingBuf) {
-              this.sttUtteranceBuffers.set(sessionKey, { text, firstAt: Date.now(), sourceLanguage: detectedSource });
-            } else {
-              // Deduplicate: skip if this fragment is identical or very similar to the last appended text
-              const lastFragment = existingBuf.text.split(/\s{2,}/).pop()?.trim() || '';
-              if (lastFragment && this.isSimilarText(text.trim(), lastFragment)) {
-                console.log(`[STT] Dedup: skipping duplicate fragment "${text.trim()}" (matches last: "${lastFragment}")`);
-                return;
-              }
-              existingBuf.text = existingBuf.text ? `${existingBuf.text} ${text}` : text;
-              if (!existingBuf.sourceLanguage && detectedSource) existingBuf.sourceLanguage = detectedSource;
-            }
-
-            const buf = this.sttUtteranceBuffers.get(sessionKey)!;
-            const combinedText = buf.text.trim();
-            const elapsedMs = Date.now() - buf.firstAt;
-            const shouldFlush = combinedText.length >= minUtteranceChars || elapsedMs >= maxBufferMs;
-
-            const flushNow = async (finalText: string, finalSourceLanguage?: string) => {
-              // The translated audio should be delivered to `receiverUserId`.
-              // So the target language must come from the receiver's selected language.
-              const memKey = `${data.callId}:${receiverUserId}`;
-              let targetLanguage = this.callLanguages.get(memKey) || '';
-              if (!targetLanguage) {
-                const receiverUser = await this.userModel.findById(receiverUserId).select('preferredLanguage').lean();
-                targetLanguage = (receiverUser as any)?.preferredLanguage || 'en';
-                this.callLanguages.set(memKey, targetLanguage);
-              }
-
-              // Validate detected language — warn if it doesn't match expected languages.
-              const receiverUser = await this.userModel.findById(receiverUserId).select('preferredLanguage').lean();
-              const expectedLangs = ['en', targetLanguage, (receiverUser as any)?.preferredLanguage].filter(Boolean);
-              const expectedLangsSet = new Set(expectedLangs);
-
-              if (finalSourceLanguage && !expectedLangsSet.has(finalSourceLanguage)) {
-                console.warn(`[STT] Unexpected language "${finalSourceLanguage}" (expected [${expectedLangs}]), processing anyway`);
-              }
-
-              // Unicode script validation — warn but still process
-              if (!this.isValidScript(finalText, expectedLangs)) {
-                console.warn(`[STT] Unexpected script for languages [${expectedLangs}]: "${finalText.substring(0, 50)}", processing anyway`);
-              }
-
-              console.log(`[STT→Translate] Source: ${finalSourceLanguage || 'auto'}, Target: ${targetLanguage}`);
-
-              // If source and target are the same, skip translation — send original text directly
-              if (finalSourceLanguage && finalSourceLanguage === targetLanguage) {
-                console.log(`[STT→Translate] Same language (${finalSourceLanguage}), skipping translation`);
-                this.emitToUser(receiverUserId, 'call:translated-text', {
-                  callId: data.callId,
-                  originalText: finalText,
-                  translatedText: finalText,
-                  targetLanguage,
-                  fromUserId: fromUserIdForClient,
-                });
-                return;
-              }
-
-              const result = await this.translationService.translateText(finalText, targetLanguage, finalSourceLanguage);
-              console.log(`[STT→Translate] "${finalText}" → "${result.translatedText}" (${targetLanguage})`);
-              console.log(
-                `[voice_stage] translation_done engine=elevenlabs callId=${data.callId} userId=${userId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} srcChars=${finalText.length} dstChars=${result.translatedText.length}`,
-              );
-
-              let audioBase64: string | undefined;
-              try {
-                const audioBuffer = await this.translationService.textToSpeech(result.translatedText, targetLanguage);
-                audioBase64 = audioBuffer.toString('base64');
-                console.log(
-                  `[voice_stage] tts_done engine=elevenlabs callId=${data.callId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} audioBytes=${audioBuffer.length}`,
-                );
-              } catch (ttsErr) {
-                console.error('[STT→TTS] TTS failed:', ttsErr);
-              }
-
-              if (audioBase64) {
-                // Echo prevention: cooldown/compare transcripts for the receiver (who will play TTS).
-                this.ttsCooldowns.set(receiverUserId, Date.now());
-                this.lastTtsText.set(receiverUserId, result.translatedText);
-              }
-
-              this.emitToUser(receiverUserId, 'call:translated-text', {
-                callId: data.callId,
-                originalText: finalText,
-                translatedText: result.translatedText,
-                targetLanguage,
-                fromUserId: fromUserIdForClient,
-                audioBase64,
-              });
-            };
-
-            if (!shouldFlush) {
-              if (!buf.flushTimer) {
-                buf.flushTimer = setTimeout(() => {
-                  const currentBuf = this.sttUtteranceBuffers.get(sessionKey);
-                  if (!currentBuf) return;
-                  this.sttUtteranceBuffers.delete(sessionKey);
-                  const t = currentBuf.text.trim();
-                  const src = currentBuf.sourceLanguage;
-                  flushNow(t, src).catch((err) => console.error('[STT→Translate] Flush failed:', err));
-                }, maxBufferMs);
-              }
-              return;
-            }
-
-            // Flush now
-            if (buf.flushTimer) clearTimeout(buf.flushTimer);
-            this.sttUtteranceBuffers.delete(sessionKey);
-            flushNow(combinedText, buf.sourceLanguage).catch((err) => {
-              console.error('[STT→Translate] Translation failed:', err);
-            });
-          }
-        },
-        onError: (error: string) => {
-          console.error(`[STT] Error for user ${userId}:`, error);
-          client.emit('call:stt-error', { callId: data.callId, error });
-        },
-        onClose: () => {
-          console.log(`[STT] Session closed for user ${userId}`);
-          this.sttSessions.delete(sessionKey);
-        },
-      });
-
-      this.sttSessions.set(sessionKey, session);
-      client.emit('call:stt-started', { callId: data.callId });
-    } catch (err) {
-      console.error('[STT] Failed to start:', err);
-      client.emit('call:stt-error', { callId: data.callId, error: 'Failed to start STT' });
-    }
+    // DISABLED: Server-side STT (ElevenLabs/Whisper) replaced by browser STT.
+    // Client uses browser SpeechRecognition → call:speech → translate → TTS.
+    // Tell client immediately to use browser STT fallback.
+    client.emit('call:stt-error', { callId: data?.callId, error: 'Server STT disabled — use browser STT' });
   }
 
   @SubscribeMessage('call:audio-chunk')
@@ -687,49 +477,10 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     @ConnectedSocket() client: any,
     @MessageBody() data: { callId: string; audio: string },
   ) {
-    const userId = client.userId;
-    if (!userId || !data?.callId || !data?.audio) return;
-
-    const sessionKey = `${userId}:${data.callId}`;
-    const now = Date.now();
-    const lastLogAt = this.audioChunkLogAt.get(sessionKey) || 0;
-    if (now - lastLogAt > 2000) {
-      console.log(
-        `[voice_stage] audio_chunk_rx callId=${data.callId} userId=${userId} sessionKey=${sessionKey} base64Chars=${data.audio.length}`,
-      );
-      this.audioChunkLogAt.set(sessionKey, now);
-    }
-
-    // Half-duplex: don't forward audio to STT while TTS is playing on this user's device
-    if (this.pausedSttSessions.has(sessionKey)) return;
-
-    // If Whisper STT is active for this session, route audio there instead
-    const whisperBuf = this.whisperBuffers.get(sessionKey);
-    if (whisperBuf) {
-      const audioChunk = Buffer.from(data.audio, 'base64');
-      whisperBuf.chunks.push(audioChunk);
-      whisperBuf.totalBytes += audioChunk.length;
-
-      if (whisperBuf.timer) clearTimeout(whisperBuf.timer);
-
-      const flushThreshold = Number(process.env.WHISPER_FLUSH_THRESHOLD_BYTES ?? '24000'); // ~0.75s default
-      if (whisperBuf.totalBytes >= flushThreshold) {
-        this.flushWhisperBuffer(client, sessionKey, data.callId, userId);
-      } else {
-        whisperBuf.timer = setTimeout(async () => {
-          if (this.whisperBuffers.has(sessionKey) && whisperBuf.totalBytes > 1200) {
-            await this.flushWhisperBuffer(client, sessionKey, data.callId, userId);
-          }
-        }, Number(process.env.WHISPER_SILENCE_FLUSH_MS ?? '500'));
-      }
-      return;
-    }
-
-    // Otherwise use ElevenLabs STT session
-    const session = this.sttSessions.get(sessionKey);
-    if (session) {
-      session.sendAudio(data.audio);
-    }
+    // DISABLED: Whisper PCM path is replaced by browser SpeechRecognition (call:speech).
+    // The old path picked up background noise (e.g. TV audio) and sent it to Whisper,
+    // producing wrong translations. Browser STT only captures intentional speech.
+    return;
   }
 
   @SubscribeMessage('call:pause-stt')
@@ -796,42 +547,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     @ConnectedSocket() client: any,
     @MessageBody() data: { callId: string; language: string; sttMode?: 'speaker' | 'listener' },
   ) {
-    const userId = client.userId;
-    if (!userId || !data?.callId) return;
-
-    const sessionKey = `${userId}:${data.callId}`;
-    const sttMode = data.sttMode || 'speaker';
-
-    // Check if OpenAI key is available; if not, fall back to ElevenLabs immediately
-    if (!process.env.OPENAI_API_KEY) {
-      console.log(`[Whisper STT] No OPENAI_API_KEY, falling back to ElevenLabs STT`);
-      return this.handleStartStt(client, data);
-    }
-
-    // Close any existing ElevenLabs STT session
-    const existing = this.sttSessions.get(sessionKey);
-    if (existing) {
-      existing.close();
-      this.sttSessions.delete(sessionKey);
-    }
-
-    // Clear any existing Whisper buffer
-    const existingBuf = this.whisperBuffers.get(sessionKey);
-    if (existingBuf?.timer) clearTimeout(existingBuf.timer);
-
-    console.log(`[Whisper STT] Starting for user ${userId}, call ${data.callId}, lang ${data.language}`);
-    console.log(
-      `[voice_stage] stt_started engine=whisper callId=${data.callId} userId=${userId} sttMode=${sttMode} language=${data.language}`,
-    );
-
-    this.whisperBuffers.set(sessionKey, {
-      chunks: [],
-      totalBytes: 0,
-      language: data.language,
-      sttMode,
-    });
-
-    client.emit('call:stt-started', { callId: data.callId, engine: 'whisper' });
+    // DISABLED: Whisper STT replaced by browser STT (call:speech path).
+    client.emit('call:stt-error', { callId: data?.callId, error: 'Whisper disabled — use browser STT' });
   }
 
   /**
@@ -1010,33 +727,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     @ConnectedSocket() client: any,
     @MessageBody() data: { callId: string; language: string; sttMode?: string },
   ) {
-    const userId = client.userId;
-    if (!userId || !data?.callId) return;
-
-    const sessionKey = `listener:${userId}:${data.callId}`;
-
-    if (!process.env.OPENAI_API_KEY) {
-      console.warn('[Whisper STT Listener] No OPENAI_API_KEY');
-      client.emit('call:stt-error', { callId: data.callId, error: 'OpenAI API key not configured' });
-      return;
-    }
-
-    // Clear any existing listener buffer
-    const existingBuf = this.listenerWhisperBuffers.get(sessionKey);
-    if (existingBuf?.timer) clearTimeout(existingBuf.timer);
-
-    console.log(`[Whisper STT Listener] Starting for user ${userId}, call ${data.callId}`);
-    console.log(
-      `[voice_stage] stt_started engine=whisper-listener callId=${data.callId} userId=${userId} mode=listener language=${data.language}`,
-    );
-
-    this.listenerWhisperBuffers.set(sessionKey, {
-      chunks: [],
-      totalBytes: 0,
-      language: data.language,
-    });
-
-    client.emit('call:stt-started', { callId: data.callId, engine: 'whisper-listener' });
+    // DISABLED: Listener Whisper STT replaced by browser STT.
+    client.emit('call:stt-error', { callId: data?.callId, error: 'Listener STT disabled — use browser STT' });
   }
 
   @SubscribeMessage('call:audio-chunk-listener')
@@ -1044,42 +736,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     @ConnectedSocket() client: any,
     @MessageBody() data: { callId: string; audio: string },
   ) {
-    const userId = client.userId;
-    if (!userId || !data?.callId || !data?.audio) return;
-
-    const sessionKey = `listener:${userId}:${data.callId}`;
-    const now = Date.now();
-    const lastLogAt = this.audioChunkLogAt.get(sessionKey) || 0;
-    if (now - lastLogAt > 2000) {
-      console.log(
-        `[voice_stage] audio_chunk_rx callId=${data.callId} userId=${userId} sessionKey=${sessionKey} base64Chars=${data.audio.length} mode=listener`,
-      );
-      this.audioChunkLogAt.set(sessionKey, now);
-    }
-
-    // Half-duplex: don't process while TTS is playing on this user's device
-    if (this.pausedSttSessions.has(sessionKey)) return;
-
-    const buf = this.listenerWhisperBuffers.get(sessionKey);
-    if (!buf) return;
-
-    const audioChunk = Buffer.from(data.audio, 'base64');
-    buf.chunks.push(audioChunk);
-    buf.totalBytes += audioChunk.length;
-
-    if (buf.timer) clearTimeout(buf.timer);
-
-    const flushThreshold = Number(process.env.WHISPER_FLUSH_THRESHOLD_BYTES ?? '24000');
-
-    if (buf.totalBytes >= flushThreshold) {
-      this.flushListenerWhisperBuffer(client, sessionKey, data.callId, userId);
-    } else {
-      buf.timer = setTimeout(async () => {
-        if (this.listenerWhisperBuffers.has(sessionKey) && buf.totalBytes > 1200) {
-          await this.flushListenerWhisperBuffer(client, sessionKey, data.callId, userId);
-        }
-      }, Number(process.env.WHISPER_SILENCE_FLUSH_MS ?? '500'));
-    }
+    // DISABLED: Listener Whisper path replaced by browser STT (call:speech).
+    return;
   }
 
   @SubscribeMessage('call:stop-stt-listener')
