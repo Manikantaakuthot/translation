@@ -254,7 +254,8 @@ export class TranslationService {
       tr: 'tr-TR', vi: 'vi-VN', th: 'th-TH',
     };
     // The speaker speaks in `language` (or 'en' by default). Set for STT accuracy.
-    this.speakerLanguage = langToLocale[language] || language || 'en-US';
+    // IMPORTANT: 'auto' is not a valid BCP-47 code — default to 'en-US' instead.
+    this.speakerLanguage = langToLocale[language] || (language && language !== 'auto' ? language : 'en-US');
     console.log(`[Translation] Speaker language for STT: ${this.speakerLanguage}`);
 
     const resolvedTargetLanguage = targetLanguage || language || 'en';
