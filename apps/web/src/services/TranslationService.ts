@@ -303,11 +303,15 @@ export class TranslationService {
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 3;
-    // Set language explicitly for MUCH better recognition accuracy
-    // Use the speaker's language (targetLanguage from args, or default to en-US)
-    const sttLang = this.speakerLanguage || 'en-US';
+    // Use the speaker's language for SpeechRecognition. If not explicitly set,
+    // fall back to the browser's language (navigator.language), which matches the
+    // user's device/OS language and is more likely to be their spoken language.
+    // The server detects source language and translates to the receiver's target.
+    const sttLang = this.speakerLanguage && this.speakerLanguage !== 'en-US'
+      ? this.speakerLanguage
+      : (navigator.language || 'en-US');
     recognition.lang = sttLang;
-    console.log(`[BrowserSTT] Language set to: ${sttLang}`);
+    console.log(`[BrowserSTT] Language set to: ${sttLang} (browser: ${navigator.language})`);
 
     // Accumulate interim results and send after a pause (captures full sentences)
     let interimText = '';
@@ -360,7 +364,9 @@ export class TranslationService {
         // Silence — restart recognition
         console.log('[BrowserSTT] No speech detected, continuing...');
       } else if (event.error === 'aborted') {
-        // Intentional stop — don't restart
+        // Aborted — often caused by another tab's SpeechRecognition stealing the mic.
+        // DON'T give up — the onend handler will restart with a delay.
+        console.log('[BrowserSTT] Aborted (likely another tab using mic) — will retry on end');
       } else {
         onError?.(event.error);
       }
@@ -369,7 +375,7 @@ export class TranslationService {
     recognition.onend = () => {
       // Auto-restart if still active (recognition stops after silence)
       if (this.isActive && this.browserRecognition === recognition) {
-        // Small delay to prevent rapid restart loops
+        // Delay before restart — longer delay reduces conflict when two tabs share the mic
         setTimeout(() => {
           if (this.isActive && this.browserRecognition === recognition) {
             console.log('[BrowserSTT] Recognition ended, restarting...');
@@ -379,7 +385,7 @@ export class TranslationService {
               console.warn('[BrowserSTT] Failed to restart:', err.message);
             }
           }
-        }, 300);
+        }, 1000);
       }
     };
 
