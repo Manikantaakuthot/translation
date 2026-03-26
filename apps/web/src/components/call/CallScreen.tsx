@@ -549,7 +549,7 @@ export default function CallScreen() {
       }
     };
 
-    // Listen for translated text + audio from the OTHER user
+    // Listen for translated TEXT (arrives fast, before TTS audio)
     const onTranslatedText = (data: {
       callId: string;
       originalText: string;
@@ -560,12 +560,8 @@ export default function CallScreen() {
     }) => {
       if (data.callId !== activeCall.callId) return;
       if (data.fromUserId === currentUserIdRef.current) return;
-      if (!translationActiveRef.current) {
-        // Keep normal two-way call audio untouched unless user explicitly enabled translation.
-        return;
-      }
 
-      console.log('[Translation] Received:', data.translatedText, 'lang:', data.targetLanguage, 'hasAudio:', !!data.audioBase64, 'audioSize:', data.audioBase64?.length || 0);
+      console.log('[Translation] Text received:', data.translatedText, 'lang:', data.targetLanguage, 'hasAudio:', !!data.audioBase64);
       logVoiceStage('translated_receive', {
         fromUserId: data.fromUserId,
         targetLanguage: data.targetLanguage,
@@ -583,13 +579,47 @@ export default function CallScreen() {
         setIsRemoteSpeaking(false);
       };
 
-      // Play translated audio
+      // If audio was included inline (legacy path), play it immediately
       if (data.audioBase64) {
         translationService.speakFromBase64(data.audioBase64, onPlaybackEnd, data.translatedText, data.targetLanguage);
       } else {
+        // No audio yet — use browser TTS as fast fallback while server TTS generates
         translationService.speak(data.translatedText, data.targetLanguage, onPlaybackEnd);
       }
-      // Safety release: never keep raw call audio muted indefinitely.
+      // Safety release
+      if (translationPlaybackTimeoutRef.current) clearTimeout(translationPlaybackTimeoutRef.current);
+      translationPlaybackTimeoutRef.current = setTimeout(() => {
+        setIsRemoteSpeaking(false);
+      }, 7000);
+    };
+
+    // Listen for follow-up TTS AUDIO (arrives after text, higher quality)
+    const onTranslatedAudio = (data: {
+      callId: string;
+      translatedText: string;
+      targetLanguage: string;
+      fromUserId: string;
+      audioBase64: string;
+    }) => {
+      if (data.callId !== activeCall.callId) return;
+      if (data.fromUserId === currentUserIdRef.current) return;
+
+      console.log('[Translation] Audio received:', data.audioBase64.length, 'chars for:', data.translatedText);
+
+      // Stop any browser TTS that may be playing, replace with server TTS
+      translationService.stopSpeaking();
+
+      const onPlaybackEnd = () => {
+        console.log('[Translation] Server TTS playback finished');
+        if (translationPlaybackTimeoutRef.current) {
+          clearTimeout(translationPlaybackTimeoutRef.current);
+          translationPlaybackTimeoutRef.current = null;
+        }
+        setIsRemoteSpeaking(false);
+      };
+
+      translationService.speakFromBase64(data.audioBase64, onPlaybackEnd, data.translatedText, data.targetLanguage);
+      // Reset safety timeout
       if (translationPlaybackTimeoutRef.current) clearTimeout(translationPlaybackTimeoutRef.current);
       translationPlaybackTimeoutRef.current = setTimeout(() => {
         setIsRemoteSpeaking(false);
@@ -607,8 +637,9 @@ export default function CallScreen() {
     socket.on('call:ice-candidate', onIceCandidate);
     socket.on('call:ended', onCallEnded);
     socket.on('call:translated-text', onTranslatedText);
+    socket.on('call:translated-audio', onTranslatedAudio);
     socket.on('call:language-changed', onLanguageChanged);
-    console.log('[Translation] Registered call:translated-text listener in WebRTC effect for call', activeCall.callId);
+    console.log('[Translation] Registered call:translated-text + call:translated-audio listeners for call', activeCall.callId);
 
     // For the initiator: track call:answered independently of getUserMedia
     let answered = false;
@@ -725,6 +756,7 @@ export default function CallScreen() {
       socket.off('call:ended', onCallEnded);
       socket.off('call:answered');
       socket.off('call:translated-text', onTranslatedText);
+      socket.off('call:translated-audio', onTranslatedAudio);
       socket.off('call:language-changed', onLanguageChanged);
       translationService.stopSpeaking();
       if (translationPlaybackTimeoutRef.current) {

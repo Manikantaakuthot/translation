@@ -285,10 +285,21 @@ export class TranslationService {
     }
   }
 
+  // Watchdog timer — restarts recognition if it silently dies
+  private sttWatchdog: any = null;
+  private lastSttEventAt = 0;
+
   /**
    * Browser SpeechRecognition — uses the built-in Web Speech API.
    * Transcribes speech locally, then sends text via `call:speech` socket event
    * to the server for translation + TTS generation.
+   *
+   * FIXES applied for robust continuous recognition:
+   * - Fast restart (200ms) when recognition ends (Chrome stops after silence/~60s)
+   * - Aggressive interim sending (1.5s timeout) so partial speech isn't lost
+   * - Watchdog timer restarts recognition if it silently dies
+   * - No minimum length filter on final results (even single words are valid)
+   * - Reset interimText on every final so new sentences are captured
    */
   private async startBrowserRecording(
     socket: Socket,
@@ -302,109 +313,169 @@ export class TranslationService {
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.maxAlternatives = 3;
-    // Use the speaker's language for SpeechRecognition. If not explicitly set,
-    // fall back to the browser's language (navigator.language), which matches the
-    // user's device/OS language and is more likely to be their spoken language.
-    // The server detects source language and translates to the receiver's target.
+    recognition.maxAlternatives = 1; // Fewer alternatives = faster results
     const sttLang = this.speakerLanguage && this.speakerLanguage !== 'en-US'
       ? this.speakerLanguage
       : (navigator.language || 'en-US');
     recognition.lang = sttLang;
     console.log(`[BrowserSTT] Language set to: ${sttLang} (browser: ${navigator.language})`);
 
-    // Accumulate interim results and send after a pause (captures full sentences)
+    // Track interim text for timeout-based sending
     let interimText = '';
     let interimTimer: any = null;
+    // Track what was already sent to avoid duplicates
+    let lastSentText = '';
+    // Track consecutive restart failures
+    let restartFailures = 0;
+    const MAX_RESTART_FAILURES = 10;
 
-    const sendSpeech = (text: string) => {
-      if (text.length < 2) return;
-      console.log(`[BrowserSTT] Sending transcript: "${text}" → call:speech`);
-      socket.emit('call:speech', { callId, text });
+    const sendSpeech = (text: string, isInterim = false) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      // Dedup: don't send if we already sent the same (or very similar) text
+      if (trimmed === lastSentText) {
+        console.log(`[BrowserSTT] Skipping duplicate: "${trimmed}"`);
+        return;
+      }
+      // Also skip if the final is a substring of what we already sent as interim
+      if (!isInterim && lastSentText && lastSentText.includes(trimmed)) {
+        console.log(`[BrowserSTT] Skipping final (already sent as part of interim): "${trimmed}"`);
+        return;
+      }
+      lastSentText = trimmed;
+      console.log(`[BrowserSTT] Sending ${isInterim ? 'interim' : 'final'}: "${trimmed}" → call:speech`);
+      socket.emit('call:speech', { callId, text: trimmed });
     };
 
     recognition.onresult = (event: any) => {
+      this.lastSttEventAt = Date.now();
+      restartFailures = 0; // Got a result, reset failure counter
+
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         if (result.isFinal) {
           // Clear any pending interim timer
           if (interimTimer) { clearTimeout(interimTimer); interimTimer = null; }
-          interimText = '';
 
-          // Use best alternative
           const text = result[0].transcript.trim();
-          console.log(`[BrowserSTT] Final: "${text}"`);
-          sendSpeech(text);
+          if (text) {
+            console.log(`[BrowserSTT] Final: "${text}" (confidence: ${result[0].confidence?.toFixed(2)})`);
+            sendSpeech(text, false);
+          }
+          interimText = ''; // Reset so next sentence starts fresh
         } else {
-          // Track interim text — if no final comes within 3s, send what we have
+          // Interim result — accumulate and send if no final comes within 800ms
           const interim = result[0].transcript.trim();
-          if (interim.length > interimText.length) {
+          if (interim && interim !== interimText) {
             interimText = interim;
             if (interimTimer) clearTimeout(interimTimer);
             interimTimer = setTimeout(() => {
-              if (interimText.length >= 3) {
-                console.log(`[BrowserSTT] Sending interim (no final after 3s): "${interimText}"`);
-                sendSpeech(interimText);
+              if (interimText.length >= 2) {
+                sendSpeech(interimText, true);
                 interimText = '';
               }
-            }, 3000);
+            }, 800);
           }
         }
       }
     };
 
     recognition.onerror = (event: any) => {
+      this.lastSttEventAt = Date.now();
       console.error('[BrowserSTT] Error:', event.error);
       if (event.error === 'not-allowed') {
-        // Mic denied — stop trying, prevent restart loop
         this.isActive = false;
         this.browserRecognition = null;
+        this.clearSttWatchdog();
         onError?.('Microphone permission denied');
       } else if (event.error === 'no-speech') {
-        // Silence — restart recognition
-        console.log('[BrowserSTT] No speech detected, continuing...');
+        // Silence — this is normal, onend will restart
+        console.log('[BrowserSTT] No speech detected, will restart...');
       } else if (event.error === 'aborted') {
-        // Aborted — often caused by another tab's SpeechRecognition stealing the mic.
-        // DON'T give up — the onend handler will restart with a delay.
-        console.log('[BrowserSTT] Aborted (likely another tab using mic) — will retry on end');
+        console.log('[BrowserSTT] Aborted — will retry on end');
+      } else if (event.error === 'network') {
+        console.log('[BrowserSTT] Network error — will retry on end');
       } else {
-        onError?.(event.error);
+        console.warn('[BrowserSTT] Unexpected error:', event.error);
       }
     };
 
     recognition.onend = () => {
-      // Auto-restart if still active (recognition stops after silence)
+      // Send any accumulated interim text before restarting
+      if (interimTimer) { clearTimeout(interimTimer); interimTimer = null; }
+      if (interimText.length >= 2) {
+        console.log(`[BrowserSTT] Sending remaining interim before restart: "${interimText}"`);
+        sendSpeech(interimText);
+        interimText = '';
+      }
+
+      // Fast restart — 200ms to minimize gap
       if (this.isActive && this.browserRecognition === recognition) {
-        // Delay before restart — longer delay reduces conflict when two tabs share the mic
+        const delay = restartFailures > 3 ? 1000 : 200;
         setTimeout(() => {
           if (this.isActive && this.browserRecognition === recognition) {
-            console.log('[BrowserSTT] Recognition ended, restarting...');
             try {
               recognition.start();
+              restartFailures = 0;
+              console.log('[BrowserSTT] Restarted recognition');
             } catch (err: any) {
-              console.warn('[BrowserSTT] Failed to restart:', err.message);
+              restartFailures++;
+              console.warn(`[BrowserSTT] Restart failed (${restartFailures}/${MAX_RESTART_FAILURES}):`, err.message);
+              if (restartFailures >= MAX_RESTART_FAILURES) {
+                console.error('[BrowserSTT] Too many restart failures, creating new instance');
+                this.browserRecognition = null;
+                restartFailures = 0;
+                // Create a fresh SpeechRecognition instance
+                this.startBrowserRecording(socket, callId, targetLanguage, onError);
+              }
             }
           }
-        }, 1000);
+        }, delay);
       }
     };
 
-    // Start with retry logic — can fail if called too quickly
+    // Start with retry logic
     const startRecognition = () => {
       try {
         recognition.start();
+        this.lastSttEventAt = Date.now();
       } catch (err: any) {
         if (err.message?.includes('already started')) return;
-        console.warn('[BrowserSTT] Start failed, retrying in 500ms:', err.message);
+        console.warn('[BrowserSTT] Start failed, retrying in 300ms:', err.message);
         setTimeout(() => {
-          try { recognition.start(); } catch {}
-        }, 500);
+          try { recognition.start(); this.lastSttEventAt = Date.now(); } catch {}
+        }, 300);
       }
     };
     startRecognition();
     this.browserRecognition = recognition;
     this.isActive = true;
+
+    // Watchdog: restart recognition if no events received for 10 seconds
+    this.clearSttWatchdog();
+    this.sttWatchdog = setInterval(() => {
+      if (!this.isActive || !this.browserRecognition) {
+        this.clearSttWatchdog();
+        return;
+      }
+      const silentMs = Date.now() - this.lastSttEventAt;
+      if (silentMs > 10000) {
+        console.warn(`[BrowserSTT] Watchdog: no events for ${(silentMs / 1000).toFixed(0)}s, restarting...`);
+        try {
+          this.browserRecognition.abort();
+        } catch {}
+        // onend handler will restart it
+      }
+    }, 5000);
+
     console.log(`[BrowserSTT] Started speech recognition for call ${callId}, target language: ${targetLanguage}`);
+  }
+
+  private clearSttWatchdog() {
+    if (this.sttWatchdog) {
+      clearInterval(this.sttWatchdog);
+      this.sttWatchdog = null;
+    }
   }
 
   /**
@@ -655,6 +726,7 @@ export class TranslationService {
 
     // Stop Browser SpeechRecognition
     this.browserSttActive = false;
+    this.clearSttWatchdog();
     if (this.browserRecognition) {
       try {
         this.browserRecognition.onend = null; // Prevent auto-restart

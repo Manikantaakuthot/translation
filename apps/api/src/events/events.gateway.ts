@@ -287,6 +287,13 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
           this.sttUtteranceBuffers.delete(key);
         }
       }
+      // Clean up speech buffers for this user
+      for (const [key, buf] of this.speechBuffers) {
+        if (key.startsWith(`${userId}:`)) {
+          clearTimeout(buf.timer);
+          this.speechBuffers.delete(key);
+        }
+      }
       // Clean up in-memory language preferences for this user
       for (const key of this.callLanguages.keys()) {
         if (key.includes(userId)) this.callLanguages.delete(key);
@@ -381,6 +388,15 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     this.emitToUser(data.targetUserId, 'call:ice-candidate', { candidate: data.candidate, fromUserId: client.userId });
   }
 
+  // Speech buffering: accumulate short fragments into full sentences before translating
+  // This dramatically improves translation quality for natural speech
+  private speechBuffers = new Map<
+    string,
+    { text: string; timer: ReturnType<typeof setTimeout>; callId: string; otherUserId: string; targetLanguage: string }
+  >();
+  private readonly SPEECH_BUFFER_TIMEOUT_MS = 400; // Flush after 400ms of silence (reduced for lower latency)
+  private readonly SPEECH_BUFFER_MAX_LEN = 200; // Flush if buffer exceeds this length
+
   @SubscribeMessage('call:speech')
   async handleCallSpeech(
     @ConnectedSocket() client: any,
@@ -401,63 +417,124 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
           ? (call as any).calleeId.toString()
           : (call as any).callerId.toString();
 
-      // Resolve target language from the RECEIVER's call preference.
-      // Requirement: each listener hears incoming speech in their selected language.
-      const memKey = `${data.callId}:${otherUserId}`;
+      // Resolve target language from the SPEAKER's call preference (audio plays back on toggle-ON side)
+      const memKey = `${data.callId}:${userId}`;
       let targetLanguage: string = this.callLanguages.get(memKey) || data.targetLanguage || '';
       if (!targetLanguage) {
-        const receiverUser = await this.userModel.findById(otherUserId).select('preferredLanguage').lean();
-        targetLanguage = (receiverUser as any)?.preferredLanguage || 'en';
-        // Seed in-memory map for future reads
+        const speakerUser = await this.userModel.findById(userId).select('preferredLanguage').lean();
+        targetLanguage = (speakerUser as any)?.preferredLanguage || 'en';
         this.callLanguages.set(memKey, targetLanguage);
       }
 
-      // Detect source language via translation service and skip if same as target
-      const detected = await this.translationService.detectLanguage(data.text);
-      if (detected === targetLanguage) {
-        console.log(`[Translation] Same language (${detected}), skipping translation`);
-        this.emitToUser(otherUserId, 'call:translated-text', {
+      // Buffer speech fragments for better translation quality
+      const bufferKey = `${userId}:${data.callId}`;
+      const existing = this.speechBuffers.get(bufferKey);
+
+      if (existing) {
+        clearTimeout(existing.timer);
+        existing.text += ' ' + data.text.trim();
+        // Flush immediately if buffer is long enough (full sentence)
+        if (existing.text.length >= this.SPEECH_BUFFER_MAX_LEN) {
+          this.speechBuffers.delete(bufferKey);
+          await this.translateAndEmit(existing.text.trim(), data.callId, userId, otherUserId, targetLanguage);
+          return;
+        }
+        // Otherwise reset the flush timer
+        existing.timer = setTimeout(async () => {
+          this.speechBuffers.delete(bufferKey);
+          await this.translateAndEmit(existing.text.trim(), data.callId, userId, otherUserId, targetLanguage);
+        }, this.SPEECH_BUFFER_TIMEOUT_MS);
+      } else {
+        // First fragment — start a new buffer with a flush timer
+        const timer = setTimeout(async () => {
+          const buf = this.speechBuffers.get(bufferKey);
+          if (buf) {
+            this.speechBuffers.delete(bufferKey);
+            await this.translateAndEmit(buf.text.trim(), data.callId, userId, otherUserId, targetLanguage);
+          }
+        }, this.SPEECH_BUFFER_TIMEOUT_MS);
+
+        this.speechBuffers.set(bufferKey, {
+          text: data.text.trim(),
+          timer,
           callId: data.callId,
-          originalText: data.text,
-          translatedText: data.text,
+          otherUserId,
           targetLanguage,
-          fromUserId: userId,
         });
-        return;
       }
-
-      // Translate the speech text
-      const result = await this.translationService.translateText(data.text, targetLanguage);
-      console.log(`[Translation] Result: "${result.translatedText}" (${targetLanguage})`);
-
-      // Generate TTS audio for the translated text
-      let audioBase64: string | undefined;
-      try {
-        console.log(`[Translation] Generating TTS for "${result.translatedText}" in ${targetLanguage}...`);
-        const audioBuffer = await this.translationService.textToSpeech(result.translatedText, targetLanguage);
-        audioBase64 = audioBuffer.toString('base64');
-        console.log(`[Translation] TTS audio generated: ${audioBase64.length} chars base64 → sending to ${otherUserId}`);
-      } catch (ttsErr) {
-        console.error('[Translation] TTS failed, sending text only:', (ttsErr as any)?.message || ttsErr);
-      }
-
-      // Record TTS cooldown + text for the receiving user (echo prevention)
-      if (audioBase64) {
-        this.ttsCooldowns.set(otherUserId, Date.now());
-        this.lastTtsText.set(otherUserId, result.translatedText);
-      }
-
-      // Send translated text + audio to the OTHER user
-      this.emitToUser(otherUserId, 'call:translated-text', {
-        callId: data.callId,
-        originalText: data.text,
-        translatedText: result.translatedText,
-        targetLanguage,
-        fromUserId: userId,
-        audioBase64,
-      });
     } catch (err) {
       console.error('[Translation] call:speech error:', err);
+    }
+  }
+
+  /** Translate buffered speech text and emit back to the SPEAKER (toggle-ON side) */
+  private async translateAndEmit(
+    text: string,
+    callId: string,
+    fromUserId: string,
+    toUserId: string,
+    targetLanguage: string,
+  ): Promise<void> {
+    if (!text.trim()) return;
+
+    try {
+      const startMs = Date.now();
+      console.log(`[Translation] Translating: "${text}" → ${targetLanguage}`);
+
+      // Skip separate detectLanguage call — browser STT outputs English,
+      // and the translation providers auto-detect source language anyway.
+      // If target is English and input is English, translation will return same text (fast passthrough).
+
+      // Translate the speech text
+      const result = await this.translationService.translateText(text, targetLanguage);
+      const translateMs = Date.now() - startMs;
+      console.log(`[Translation] Result: "${result.translatedText}" (${targetLanguage}) [${translateMs}ms]`);
+
+      // IMMEDIATELY send translated TEXT to the speaker (low latency — no waiting for TTS)
+      this.emitToUser(fromUserId, 'call:translated-text', {
+        callId,
+        originalText: text,
+        translatedText: result.translatedText,
+        targetLanguage,
+        fromUserId: toUserId, // Spoofed so client filter doesn't block it
+      });
+
+      // Generate TTS audio IN PARALLEL (sent as a follow-up event)
+      this.generateAndSendTTS(result.translatedText, targetLanguage, callId, fromUserId, toUserId, startMs);
+    } catch (err) {
+      console.error('[Translation] translateAndEmit error:', err);
+    }
+  }
+
+  /** Generate TTS audio and send as a follow-up event (non-blocking) */
+  private async generateAndSendTTS(
+    translatedText: string,
+    targetLanguage: string,
+    callId: string,
+    fromUserId: string,
+    toUserId: string,
+    startMs: number,
+  ): Promise<void> {
+    try {
+      const audioBuffer = await this.translationService.textToSpeech(translatedText, targetLanguage);
+      const audioBase64 = audioBuffer.toString('base64');
+      const totalMs = Date.now() - startMs;
+      console.log(`[Translation] TTS audio ready: ${audioBase64.length} chars [total ${totalMs}ms]`);
+
+      // Record TTS cooldown + text for the speaker (echo prevention)
+      this.ttsCooldowns.set(fromUserId, Date.now());
+      this.lastTtsText.set(fromUserId, translatedText);
+
+      // Send audio as a follow-up event
+      this.emitToUser(fromUserId, 'call:translated-audio', {
+        callId,
+        translatedText,
+        targetLanguage,
+        fromUserId: toUserId,
+        audioBase64,
+      });
+    } catch (ttsErr) {
+      console.error('[Translation] TTS failed:', (ttsErr as any)?.message || ttsErr);
     }
   }
 
