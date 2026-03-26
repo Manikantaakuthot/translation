@@ -552,162 +552,21 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
-   * Handle audio chunks for Whisper STT.
-   * Accumulates audio and transcribes when enough data is collected (~2s).
+   * DISABLED: Whisper audio processing replaced by browser STT (call:speech path).
    */
   @SubscribeMessage('call:whisper-audio')
   async handleWhisperAudio(
     @ConnectedSocket() client: any,
     @MessageBody() data: { callId: string; audio: string },
   ) {
-    const userId = client.userId;
-    if (!userId || !data?.callId || !data?.audio) return;
-
-    const sessionKey = `${userId}:${data.callId}`;
-
-    // Half-duplex: don't process audio while TTS is playing
-    if (this.pausedSttSessions.has(sessionKey)) return;
-
-    const buf = this.whisperBuffers.get(sessionKey);
-    if (!buf) return; // Whisper STT not started for this session
-
-    const audioChunk = Buffer.from(data.audio, 'base64');
-    buf.chunks.push(audioChunk);
-    buf.totalBytes += audioChunk.length;
-
-    // Reset flush timer on each chunk
-    if (buf.timer) clearTimeout(buf.timer);
-
-    // 16kHz 16-bit mono = 32000 bytes/sec. Keep this low for near real-time updates.
-    const flushThreshold = Number(process.env.WHISPER_FLUSH_THRESHOLD_BYTES ?? '24000');
-
-    if (buf.totalBytes >= flushThreshold) {
-      await this.flushWhisperBuffer(client, sessionKey, data.callId, userId);
-    } else {
-      // Flush quickly on brief silence for lower end-to-end latency.
-      buf.timer = setTimeout(async () => {
-        if (this.whisperBuffers.has(sessionKey) && buf.totalBytes > 1200) {
-          await this.flushWhisperBuffer(client, sessionKey, data.callId, userId);
-        }
-      }, Number(process.env.WHISPER_SILENCE_FLUSH_MS ?? '500'));
-    }
+    // DISABLED: All Whisper STT replaced by browser STT. Ignore all whisper audio.
+    return;
   }
 
-  /** Flush accumulated Whisper audio buffer → transcribe → translate → TTS */
+  /** DISABLED: Whisper flush replaced by browser STT. */
   private async flushWhisperBuffer(client: any, sessionKey: string, callId: string, userId: string) {
-    const buf = this.whisperBuffers.get(sessionKey);
-    if (!buf || buf.chunks.length === 0) return;
-
-    // Extract and reset buffer
-    const audioBuffer = Buffer.concat(buf.chunks);
-    const language = buf.language;
-    const sttMode = buf.sttMode || 'speaker';
-    buf.chunks = [];
-    buf.totalBytes = 0;
-    if (buf.timer) clearTimeout(buf.timer);
-
-    try {
-      const audioBase64 = audioBuffer.toString('base64');
-      console.log(`[Whisper STT] Transcribing ${audioBuffer.length} bytes for user ${userId}`);
-
-      const result = await this.whisperSttService.transcribe(audioBase64, language, true);
-
-      if (!result.text.trim() || result.text.trim().length < 2) {
-        console.log(`[Whisper STT] Empty/too-short transcript, skipping`);
-        return;
-      }
-
-      console.log(`[Whisper STT] Transcript: "${result.text}" (detected: ${result.detectedLanguage})`);
-      console.log(
-        `[voice_stage] transcript_final engine=whisper callId=${callId} userId=${userId} chars=${result.text.trim().length} detected=${result.detectedLanguage || language || 'unknown'}`,
-      );
-
-      // Send transcript to client for display
-      client.emit('call:stt-transcript', {
-        callId,
-        text: result.text,
-        isFinal: true,
-        engine: 'whisper',
-      });
-
-      // Now translate + TTS (same flow as ElevenLabs STT)
-      const call = await this.callModel.findById(callId).lean();
-      if (!call) return;
-
-      const otherUserId =
-        (call as any).callerId.toString() === userId
-          ? (call as any).calleeId.toString()
-          : (call as any).callerId.toString();
-
-      const receiverUserId = sttMode === 'listener' ? userId : otherUserId;
-      const fromUserIdForClient = sttMode === 'listener' ? otherUserId : userId;
-
-      // Get target language from the receiver's selected language.
-      const memKey = `${callId}:${receiverUserId}`;
-      let targetLanguage = this.callLanguages.get(memKey) || '';
-      if (!targetLanguage) {
-        const receiverUser = await this.userModel.findById(receiverUserId).select('preferredLanguage').lean();
-        targetLanguage = (receiverUser as any)?.preferredLanguage || 'en';
-        this.callLanguages.set(memKey, targetLanguage);
-      }
-
-      // Skip translation if same language
-      const detectedLang = result.detectedLanguage || language;
-      if (detectedLang && detectedLang === targetLanguage) {
-        console.log(`[Whisper→Translate] Same language (${detectedLang}), skipping translation`);
-        this.emitToUser(receiverUserId, 'call:translated-text', {
-          callId,
-          originalText: result.text,
-          translatedText: result.text,
-          targetLanguage,
-          fromUserId: fromUserIdForClient,
-        });
-        return;
-      }
-
-      // Translate
-      const translation = await this.translationService.translateText(result.text, targetLanguage, detectedLang);
-      console.log(`[Whisper→Translate] "${result.text}" → "${translation.translatedText}" (${targetLanguage})`);
-      console.log(
-        `[voice_stage] translation_done engine=whisper callId=${callId} userId=${userId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} srcChars=${result.text.length} dstChars=${translation.translatedText.length}`,
-      );
-
-      // TTS
-      let ttsAudioBase64: string | undefined;
-      try {
-        const ttsBuffer = await this.translationService.textToSpeech(translation.translatedText, targetLanguage);
-        ttsAudioBase64 = ttsBuffer.toString('base64');
-        console.log(
-          `[voice_stage] tts_done engine=whisper callId=${callId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} audioBytes=${ttsBuffer.length}`,
-        );
-      } catch (ttsErr) {
-        console.error('[Whisper→TTS] TTS failed:', ttsErr);
-      }
-
-      if (ttsAudioBase64) {
-        this.ttsCooldowns.set(receiverUserId, Date.now());
-        this.lastTtsText.set(receiverUserId, translation.translatedText);
-      }
-
-      this.emitToUser(receiverUserId, 'call:translated-text', {
-        callId,
-        originalText: result.text,
-        translatedText: translation.translatedText,
-        targetLanguage,
-        fromUserId: fromUserIdForClient,
-        audioBase64: ttsAudioBase64,
-      });
-    } catch (err: any) {
-      const isQuotaError = err?.status === 429 || err?.code === 'insufficient_quota';
-      console.error(`[Whisper STT] Transcription error (quota: ${isQuotaError}):`, err?.message || err);
-
-      // On ANY Whisper failure: clean up buffer and tell client to use browser STT fallback.
-      // The client will start browser SpeechRecognition and send text via call:speech,
-      // which we translate + TTS without needing OpenAI at all.
-      console.log(`[Whisper STT] Whisper failed for session ${sessionKey}, telling client to use browser STT`);
-      this.whisperBuffers.delete(sessionKey);
-      client.emit('call:stt-error', { callId, error: 'Whisper transcription failed — switching to browser STT' });
-    }
+    // DISABLED: All Whisper STT replaced by browser STT.
+    return;
   }
 
   // ─── LISTENER MODE: Separate Whisper STT for remote stream audio ─────────
@@ -757,106 +616,10 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
   }
 
-  /** Flush listener-mode Whisper buffer → transcribe → translate → send TTS back to THIS user */
+  /** DISABLED: Listener Whisper flush replaced by browser STT. */
   private async flushListenerWhisperBuffer(client: any, sessionKey: string, callId: string, userId: string) {
-    const buf = this.listenerWhisperBuffers.get(sessionKey);
-    if (!buf || buf.chunks.length === 0) return;
-
-    const audioBuffer = Buffer.concat(buf.chunks);
-    const language = buf.language;
-    buf.chunks = [];
-    buf.totalBytes = 0;
-    if (buf.timer) clearTimeout(buf.timer);
-
-    try {
-      const audioBase64 = audioBuffer.toString('base64');
-      console.log(`[Whisper STT Listener] Transcribing ${audioBuffer.length} bytes for user ${userId}`);
-
-      const result = await this.whisperSttService.transcribe(audioBase64, language, true);
-
-      if (!result.text.trim() || result.text.trim().length < 2) return;
-
-      console.log(`[Whisper STT Listener] Transcript: "${result.text}" (detected: ${result.detectedLanguage})`);
-      console.log(
-        `[voice_stage] transcript_final engine=whisper-listener callId=${callId} userId=${userId} chars=${result.text.trim().length} detected=${result.detectedLanguage || language || 'unknown'}`,
-      );
-
-      // Find the other user in the call (the speaker whose voice we captured)
-      const call = await this.callModel.findById(callId).lean();
-      if (!call) return;
-
-      const otherUserId =
-        (call as any).callerId.toString() === userId
-          ? (call as any).calleeId.toString()
-          : (call as any).callerId.toString();
-
-      // In LISTENER mode: the receiver is THIS user (userId) — they want to hear the translation
-      const receiverUserId = userId;
-      // fromUserId = the other user (the speaker whose voice was transcribed)
-      const fromUserIdForClient = otherUserId;
-
-      // Get target language from THIS user's preference (the listener)
-      const memKey = `${callId}:${receiverUserId}`;
-      let targetLanguage = this.callLanguages.get(memKey) || '';
-      if (!targetLanguage) {
-        const receiverUser = await this.userModel.findById(receiverUserId).select('preferredLanguage').lean();
-        targetLanguage = (receiverUser as any)?.preferredLanguage || 'en';
-        this.callLanguages.set(memKey, targetLanguage);
-      }
-
-      // Skip translation if same language
-      const detectedLang = result.detectedLanguage || language;
-      if (detectedLang && detectedLang === targetLanguage) {
-        console.log(`[Whisper Listener→Translate] Same language (${detectedLang}), skipping`);
-        this.emitToUser(receiverUserId, 'call:translated-text', {
-          callId,
-          originalText: result.text,
-          translatedText: result.text,
-          targetLanguage,
-          fromUserId: fromUserIdForClient,
-        });
-        return;
-      }
-
-      // Translate
-      const translation = await this.translationService.translateText(result.text, targetLanguage, detectedLang);
-      console.log(`[Whisper Listener→Translate] "${result.text}" → "${translation.translatedText}" (${targetLanguage})`);
-      console.log(
-        `[voice_stage] translation_done engine=whisper-listener callId=${callId} userId=${userId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} srcChars=${result.text.length} dstChars=${translation.translatedText.length}`,
-      );
-
-      // TTS
-      let ttsAudioBase64: string | undefined;
-      try {
-        const ttsBuffer = await this.translationService.textToSpeech(translation.translatedText, targetLanguage);
-        ttsAudioBase64 = ttsBuffer.toString('base64');
-        console.log(
-          `[voice_stage] tts_done engine=whisper-listener callId=${callId} receiverUserId=${receiverUserId} targetLanguage=${targetLanguage} audioBytes=${ttsBuffer.length}`,
-        );
-      } catch (ttsErr) {
-        console.error('[Whisper Listener→TTS] TTS failed:', ttsErr);
-      }
-
-      if (ttsAudioBase64) {
-        this.ttsCooldowns.set(receiverUserId, Date.now());
-        this.lastTtsText.set(receiverUserId, translation.translatedText);
-      }
-
-      // Send back to THIS user (the listener who toggled translation)
-      this.emitToUser(receiverUserId, 'call:translated-text', {
-        callId,
-        originalText: result.text,
-        translatedText: translation.translatedText,
-        targetLanguage,
-        fromUserId: fromUserIdForClient,
-        audioBase64: ttsAudioBase64,
-      });
-    } catch (err: any) {
-      console.error(`[Whisper STT Listener] Error:`, err?.message || err);
-      // Clean up listener buffer so it doesn't keep retrying
-      this.listenerWhisperBuffers.delete(sessionKey);
-      client.emit('call:stt-error', { callId, error: 'Listener transcription failed — using browser STT' });
-    }
+    // DISABLED: All Whisper STT replaced by browser STT.
+    return;
   }
 
   @SubscribeMessage('call:update-language')

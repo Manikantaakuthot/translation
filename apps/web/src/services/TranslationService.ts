@@ -583,65 +583,11 @@ export class TranslationService {
     language: string,
     onError?: (error: string) => void,
   ): Promise<void> {
-    // Stop any existing listener recording
-    this.stopListenerRecording(socket, callId);
-
-    const audioTracks = remoteStream.getAudioTracks();
-    if (!audioTracks.length || audioTracks[0].readyState !== 'live') {
-      console.warn('[TranslationListener] No live audio tracks in remote stream');
-      onError?.('Remote audio stream not available yet');
-      return;
-    }
-
-    console.log('[TranslationListener] Starting listener-mode STT for remote stream');
-    this.logStage('stt_start_request', callId, { mode: 'listener' });
-    socket.emit('call:start-whisper-stt-listener', { callId, language, sttMode: 'listener' });
-
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      this.listenerAudioContext = new AudioCtx();
-      this.listenerMicSource = this.listenerAudioContext.createMediaStreamSource(remoteStream);
-      this.listenerScriptProcessor = this.listenerAudioContext.createScriptProcessor(1024, 1, 1);
-      this.listenerIsRecording = true;
-
-      this.listenerScriptProcessor.onaudioprocess = (event) => {
-        if (!this.listenerIsRecording) return;
-        let inputData = event.inputBuffer.getChannelData(0) as unknown as Float32Array;
-        const actualRate = this.listenerAudioContext?.sampleRate || 16000;
-        if (actualRate !== 16000) inputData = this.downsample(inputData, actualRate, 16000);
-
-        // Check for silence
-        let maxVal = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          const abs = Math.abs(inputData[i]);
-          if (abs > maxVal) maxVal = abs;
-        }
-        if (maxVal < 0.0005) return;
-
-        const pcm16 = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
-        const bytes = new Uint8Array(pcm16.buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        const now = Date.now();
-        if (now - this.lastListenerChunkLogAt > 2000) {
-          this.logStage('audio_chunk_tx', callId, { mode: 'listener', bytes: bytes.length });
-          this.lastListenerChunkLogAt = now;
-        }
-        socket.emit('call:audio-chunk-listener', { callId, audio: btoa(binary) });
-      };
-
-      this.listenerMicSource.connect(this.listenerScriptProcessor);
-      this.listenerScriptProcessor.connect(this.listenerAudioContext.destination);
-      console.log('[TranslationListener] Listener PCM recording started — capturing remote stream');
-    } catch (err: any) {
-      console.error('[TranslationListener] Failed to start:', err);
-      onError?.(err.message || 'Failed to capture remote audio');
-    }
+    // DISABLED: Listener-mode recording (remote stream capture via ScriptProcessor → Whisper)
+    // was capturing background TV audio (MBC news etc.) and sending it for translation.
+    // All translation now goes through browser STT → call:speech → server translate + TTS.
+    console.log('[TranslationListener] DISABLED — listener-mode recording no longer used. Use browser STT instead.');
+    return;
   }
 
   /** Stop listener-mode recording */
@@ -696,70 +642,10 @@ export class TranslationService {
     existingStream?: MediaStream,
     sttMode: 'speaker' | 'listener' = 'speaker',
   ): Promise<void> {
-    console.log('[TranslationService] startLegacyRecording called', { callId, language, sttMode, hasExistingStream: !!existingStream, isSecureContext: window.isSecureContext });
-    try {
-      if (existingStream) {
-        this.legacyMicStream = existingStream;
-        this.legacyIsShared = true;
-      } else {
-        console.log('[TranslationService] Requesting getUserMedia...');
-        this.legacyMicStream = await navigator.mediaDevices.getUserMedia({
-          audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        console.log('[TranslationService] getUserMedia succeeded, tracks:', this.legacyMicStream.getAudioTracks().length);
-      }
-
-      // Use Whisper STT (OpenAI) for highest accuracy
-      this.isActive = true;
-      this.legacyIsRecording = true;
-      console.log('[TranslationService] Emitting call:start-whisper-stt', { callId, language, sttMode });
-      this.logStage('stt_start_request', callId, { mode: sttMode, language });
-      socket.emit('call:start-whisper-stt', { callId, language, sttMode });
-
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      this.legacyAudioContext = new AudioCtx();
-      this.legacyMicSource = this.legacyAudioContext.createMediaStreamSource(this.legacyMicStream);
-      // Smaller frames improve STT endpointing/segmentation responsiveness.
-      this.legacyScriptProcessor = this.legacyAudioContext.createScriptProcessor(1024, 1, 1);
-
-      this.legacyScriptProcessor.onaudioprocess = (event) => {
-        if (!this.legacyIsRecording) return;
-        let inputData = event.inputBuffer.getChannelData(0) as unknown as Float32Array;
-        const actualRate = this.legacyAudioContext?.sampleRate || 16000;
-        if (actualRate !== 16000) inputData = this.downsample(inputData, actualRate, 16000);
-
-        let maxVal = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          const abs = Math.abs(inputData[i]);
-          if (abs > maxVal) maxVal = abs;
-        }
-        if (maxVal < 0.0005) return;
-
-        const pcm16 = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
-        const bytes = new Uint8Array(pcm16.buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        const now = Date.now();
-        if (now - this.lastSpeakerChunkLogAt > 2000) {
-          this.logStage('audio_chunk_tx', callId, { mode: sttMode, bytes: bytes.length });
-          this.lastSpeakerChunkLogAt = now;
-        }
-        socket.emit('call:audio-chunk', { callId, audio: btoa(binary) });
-      };
-
-      this.legacyIsRecording = true;
-      this.legacyMicSource.connect(this.legacyScriptProcessor);
-      this.legacyScriptProcessor.connect(this.legacyAudioContext.destination);
-      console.log('[TranslationService] Legacy PCM recording started');
-    } catch (err: any) {
-      console.error('[TranslationService] Legacy recording failed:', err);
-      onError?.(err.message || 'Failed to access microphone');
-    }
+    // DISABLED: Legacy PCM → Whisper STT path removed. All STT now uses browser SpeechRecognition.
+    // If browser STT is not available, inform the user instead of falling back to server-side Whisper.
+    console.log('[TranslationService] Legacy PCM recording DISABLED — browser STT is the only supported path');
+    onError?.('Speech recognition requires Chrome browser with SpeechRecognition support');
   }
 
   /** Stop recording — ends browser STT, ElevenLabs agent, or legacy recording */

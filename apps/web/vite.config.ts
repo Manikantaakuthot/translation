@@ -5,6 +5,11 @@ import path from 'path';
 
 export default defineConfig({
   plugins: [react()],
+  define: {
+    // Prevent "process is not defined" errors from Node.js libraries (e.g. @elevenlabs/client)
+    'process.env': JSON.stringify({}),
+    'process': JSON.stringify({ env: {} }),
+  },
   resolve: {
     alias: { '@': path.resolve(__dirname, './src') },
   },
